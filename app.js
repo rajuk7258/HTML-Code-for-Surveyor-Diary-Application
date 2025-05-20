@@ -1,45 +1,61 @@
-document.addEventListener('DOMContentLoaded', function() {
-    // Initialize CSV storage if it doesn't exist
-    if (!localStorage.getItem('surveyorDiaryCSV')) {
-        localStorage.setItem('surveyorDiaryCSV', 'Date,Time,Topic,Place of Going,Purpose of Going,Calendar Event ID\n');
-    }
-    
-    // Set today's date as default
-    const today = new Date();
-    const dateStr = today.toISOString().split('T')[0];
-    document.getElementById('date').value = dateStr;
-    
-    // Set current time as default (rounded to next 15 minutes)
-    const now = new Date();
-    const minutes = Math.ceil(now.getMinutes() / 15) * 15;
-    now.setMinutes(minutes);
-    if (minutes >= 60) {
-        now.setHours(now.getHours() + 1);
-        now.setMinutes(0);
-    }
-    document.getElementById('time').value = now.toTimeString().substring(0, 5);
-    
-    // Save button click handler
-    document.getElementById('saveBtn').addEventListener('click', saveData);
-    
-    // Download app button click handler
-    document.getElementById('downloadAppBtn').addEventListener('click', downloadApp);
-    
-    // Check for Google API client
+// Helper to get DOM elements
+const $ = id => document.getElementById(id);
+
+let googleAuth = null;
+let statusTimeout;
+
+document.addEventListener('DOMContentLoaded', () => {
+    initializeCSV();
+    setDefaultDate();
+    setDefaultTime();
+
+    $('saveBtn').addEventListener('click', saveData);
+    $('downloadAppBtn').addEventListener('click', downloadApp);
+
     loadGAPI();
+
+    // Google Sign-In/Out handler
+    $('googleSignIn').addEventListener('click', handleAuthClick);
+
+    // Optional: Disable save button until all fields are filled
+    const requiredFields = ['topic', 'place', 'purpose', 'date', 'time'];
+    requiredFields.forEach(id => $(id).addEventListener('input', toggleSaveButton));
+    toggleSaveButton();
 });
 
-// Load Google API client
+function initializeCSV() {
+    try {
+        if (!localStorage.getItem('surveyorDiaryCSV')) {
+            localStorage.setItem('surveyorDiaryCSV', 'Date,Time,Topic,Place of Going,Purpose of Going,Calendar Event ID\n');
+        }
+    } catch (e) {
+        showStatus('Local storage unavailable. Data won\'t be saved.', 'error');
+    }
+}
+
+function setDefaultDate() {
+    const today = new Date();
+    $('date').value = today.toISOString().split('T')[0];
+}
+
+function setDefaultTime() {
+    const now = new Date();
+    let minutes = Math.ceil(now.getMinutes() / 15) * 15;
+    if (minutes >= 60) {
+        now.setHours(now.getHours() + 1);
+        minutes = 0;
+    }
+    now.setMinutes(minutes);
+    now.setSeconds(0, 0);
+    $('time').value = now.toTimeString().substring(0, 5);
+}
+
 function loadGAPI() {
     const script = document.createElement('script');
     script.src = 'https://apis.google.com/js/api.js';
-    script.onload = () => {
-        gapi.load('client:auth2', initClient);
-    };
+    script.onload = () => gapi.load('client:auth2', initClient);
     document.head.appendChild(script);
 }
-
-let googleAuth = null;
 
 function initClient() {
     gapi.client.init({
@@ -48,20 +64,19 @@ function initClient() {
         scope: 'https://www.googleapis.com/auth/calendar.events'
     }).then(() => {
         googleAuth = gapi.auth2.getAuthInstance();
-        document.getElementById('googleSignIn').style.display = 'block';
+        $('googleSignIn').style.display = 'block';
+        updateGoogleSignInButton();
     });
 }
 
 function handleAuthClick() {
     if (!googleAuth) return;
-    
     if (googleAuth.isSignedIn.get()) {
-        googleAuth.signOut();
-        document.getElementById('googleSignIn').textContent = 'Sign in with Google';
+        googleAuth.signOut().then(updateGoogleSignInButton);
     } else {
         googleAuth.signIn()
             .then(() => {
-                document.getElementById('googleSignIn').textContent = 'Sign out';
+                updateGoogleSignInButton();
                 showStatus('Successfully connected to Google Calendar', 'success');
             })
             .catch(err => {
@@ -71,21 +86,32 @@ function handleAuthClick() {
     }
 }
 
+function updateGoogleSignInButton() {
+    if (googleAuth && googleAuth.isSignedIn.get()) {
+        $('googleSignIn').textContent = 'Sign out';
+    } else {
+        $('googleSignIn').textContent = 'Sign in with Google';
+    }
+}
+
+function toggleSaveButton() {
+    const requiredFields = ['topic', 'place', 'purpose', 'date', 'time'];
+    const allFilled = requiredFields.every(id => $(id).value.trim() !== '');
+    $('saveBtn').disabled = !allFilled;
+}
+
 async function saveData() {
-    // Get form values
-    const topic = document.getElementById('topic').value;
-    const place = document.getElementById('place').value;
-    const purpose = document.getElementById('purpose').value;
-    const date = document.getElementById('date').value;
-    const time = document.getElementById('time').value;
-    
-    // Validate inputs
+    const topic = $('topic').value.trim();
+    const place = $('place').value.trim();
+    const purpose = $('purpose').value.trim();
+    const date = $('date').value;
+    const time = $('time').value;
+
     if (!topic || !place || !purpose || !date || !time) {
         showStatus('Please fill all fields', 'error');
         return;
     }
-    
-    // Create entry object
+
     const entry = {
         topic,
         place,
@@ -95,35 +121,34 @@ async function saveData() {
         timestamp: new Date(`${date}T${time}`).getTime(),
         calendarEventId: null
     };
-    
+
     try {
-        // Add to Google Calendar if signed in
+        // Google Calendar
         if (googleAuth && googleAuth.isSignedIn.get()) {
             const event = await createCalendarEvent(entry);
             entry.calendarEventId = event.id;
             showStatus('Event added to Google Calendar', 'success');
         }
-        
-        // Set local reminder
+
+        // Local reminder
         setLocalReminder(entry);
-        
-        // Save to CSV
-        saveToCSV(entry);
-        
-        // Show success message
+
+        // Save to CSV (localStorage)
+        safeSetItem('surveyorDiaryCSV', (localStorage.getItem('surveyorDiaryCSV') || '') + createCSVRow(entry));
+
         showStatus('Entry saved successfully!', 'success');
-        
-        // Clear form
-        document.getElementById('topic').value = '';
-        document.getElementById('place').value = '';
-        document.getElementById('purpose').value = '';
+        clearForm();
+        toggleSaveButton();
     } catch (error) {
         console.error('Error saving data:', error);
-        showStatus('Error saving entry: ' + error.message, 'error');
+        showStatus('Error saving entry: ' + (error.message || error), 'error');
     }
 }
 
 async function createCalendarEvent(entry) {
+    if (!window.gapi || !gapi.client) {
+        throw new Error('Google API client not loaded');
+    }
     const event = {
         summary: `Survey: ${entry.topic}`,
         location: entry.place,
@@ -133,48 +158,47 @@ async function createCalendarEvent(entry) {
             timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone
         },
         end: {
-            dateTime: new Date(new Date(`${entry.date}T${entry.time}`).getTime() + 3600000).toISOString(), // 1 hour duration
+            dateTime: new Date(new Date(`${entry.date}T${entry.time}`).getTime() + 3600000).toISOString(),
             timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone
         },
         reminders: {
             useDefault: false,
             overrides: [
-                {method: 'popup', minutes: 30},
-                {method: 'popup', minutes: 10}
+                { method: 'popup', minutes: 30 },
+                { method: 'popup', minutes: 10 }
             ]
         }
     };
-    
+
     const response = await gapi.client.calendar.events.insert({
         calendarId: 'primary',
         resource: event
     });
-    
+
     return response.result;
 }
 
 function setLocalReminder(entry) {
+    const MS_30_MIN = 1800000;
     const now = new Date();
     const reminderTime = new Date(`${entry.date}T${entry.time}`);
     const timeDiff = reminderTime - now;
-    
+
     if (timeDiff > 0) {
-        // Set notification for exact time
         setTimeout(() => {
             showNotification(
                 `Survey Reminder: ${entry.topic}`,
                 `Place: ${entry.place}\nPurpose: ${entry.purpose}`
             );
         }, timeDiff);
-        
-        // Set notification for 30 minutes before
-        if (timeDiff > 1800000) { // 30 minutes in ms
+
+        if (timeDiff > MS_30_MIN) {
             setTimeout(() => {
                 showNotification(
                     `Upcoming Survey (30 mins): ${entry.topic}`,
                     `Starts soon at ${entry.time}`
                 );
-            }, timeDiff - 1800000);
+            }, timeDiff - MS_30_MIN);
         }
     } else {
         showStatus('The selected time has already passed. Reminder not set.', 'error');
@@ -182,40 +206,47 @@ function setLocalReminder(entry) {
 }
 
 function showNotification(title, body) {
-    // Check if notifications are supported
     if (!('Notification' in window)) {
         console.log('This browser does not support notifications');
         return;
     }
-    
-    // Check if permission is already granted
     if (Notification.permission === 'granted') {
         new Notification(title, { body });
-    } 
-    // Otherwise, ask for permission
-    else if (Notification.permission !== 'denied') {
+    } else if (Notification.permission !== 'denied') {
         Notification.requestPermission().then(permission => {
             if (permission === 'granted') {
                 new Notification(title, { body });
+            } else {
+                showStatus('Notifications are blocked by your browser.', 'error');
             }
         });
     }
 }
 
-function saveToCSV(entry) {
-    // Create CSV row
-    const csvRow = `"${entry.date}","${entry.time}","${entry.topic}","${entry.place}","${entry.purpose}","${entry.calendarEventId || ''}"\n`;
-    
-    // Append to existing CSV data in localStorage
-    const currentCSV = localStorage.getItem('surveyorDiaryCSV');
-    localStorage.setItem('surveyorDiaryCSV', currentCSV + csvRow);
+function createCSVRow(entry) {
+    // Escape double quotes for CSV
+    const escapeCSV = str => `"${(str || '').replace(/"/g, '""')}"`;
+    return `${escapeCSV(entry.date)},${escapeCSV(entry.time)},${escapeCSV(entry.topic)},${escapeCSV(entry.place)},${escapeCSV(entry.purpose)},${escapeCSV(entry.calendarEventId || '')}\n`;
+}
+
+function safeSetItem(key, value) {
+    try {
+        localStorage.setItem(key, value);
+    } catch (e) {
+        showStatus('Unable to save data: localStorage error', 'error');
+    }
+}
+
+function clearForm() {
+    ['topic', 'place', 'purpose'].forEach(id => $(id).value = '');
 }
 
 function showStatus(message, type) {
-    const statusDiv = document.getElementById('alarmStatus');
+    const statusDiv = $('alarmStatus');
     statusDiv.textContent = message;
     statusDiv.className = type;
-    setTimeout(() => {
+    clearTimeout(statusTimeout);
+    statusTimeout = setTimeout(() => {
         statusDiv.textContent = '';
         statusDiv.className = '';
     }, 3000);
